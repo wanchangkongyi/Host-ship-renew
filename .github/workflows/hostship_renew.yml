@@ -3,6 +3,10 @@ on:
   schedule:
     - cron: '15 3 * * *'   # 每天 UTC 03:15（北京时间 11:15）运行一次，可按需调整
   workflow_dispatch:
+permissions:
+  contents: write   # Keep Repo Active 步骤需要 push 权限；若仓库 Settings->Actions 已开
+                     # 「Read and write permissions」，这里其实可以不写，写上更保险不冲突
+
 jobs:
   renew-job:
     runs-on: ubuntu-latest
@@ -32,6 +36,17 @@ jobs:
           PANEL_USERNAME: ${{ secrets.PANEL_USERNAME }}
           PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
         run: python hostship_renew.py
+
+      - name: Upload debug screenshot (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: |
+            login_failed.png
+            error.png
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: Keep Repo Active
         run: |
