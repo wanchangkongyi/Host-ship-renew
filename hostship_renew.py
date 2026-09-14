@@ -60,7 +60,13 @@ def login(page, username, password):
         # 这里多等 2 秒后再判断一次，减少误报。
         page.wait_for_timeout(2000)
         if page.url.rstrip("/") == LOGIN_URL.rstrip("/"):
-            raise RuntimeError("登录后 URL 未发生变化，可能账号密码错误，或页面出现了未处理的错误提示")
+            screenshot_path = "login_failed.png"
+            try:
+                page.screenshot(path=screenshot_path, full_page=True)
+                err(f"已保存失败截图: {screenshot_path}（会作为 Actions Artifact 上传，可下载查看）")
+            except Exception as e:
+                warn(f"截图保存失败: {e}")
+            raise RuntimeError("登录后 URL 未发生变化，可能账号密码错误，或页面上出现了验证码/人机校验等未处理的提示")
 
     log(f"登录成功，当前 URL: {page.url}")
 
@@ -167,6 +173,11 @@ def run(playwright):
 
     except Exception as e:
         err(f"执行过程中发生错误: {e}")
+        try:
+            page.screenshot(path="error.png", full_page=True)
+            err("已保存错误截图: error.png（会作为 Actions Artifact 上传，可下载查看）")
+        except Exception as shot_err:
+            warn(f"错误截图保存失败: {shot_err}")
     finally:
         browser.close()
 
