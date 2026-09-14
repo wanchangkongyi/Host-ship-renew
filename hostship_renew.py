@@ -68,16 +68,26 @@ def login(page, username, password):
 
     log(f"登录成功，当前 URL: {page.url}")
 
-    log(f"登录成功，当前 URL: {page.url}")
-
 
 def find_server_links(page):
     """
-    进入服务器列表页（已知地址 /server），收集所有服务器详情页链接。
-    该面板基于 Jexactyl（Pterodactyl 分支），服务器卡片的入口按钮文字是
-    "Manage Server"，一般包裹在 <a href="/server/xxxx"> 里。
+    收集所有服务器详情页链接。
+    根据实际截图，登录成功后停留的首页（Dashboard）本身就直接展示了服务器卡片
+    （"Manage Server" 按钮），/server 这个路径不一定是独立的列表页，
+    所以优先在当前页（Dashboard）查找，找不到再尝试单独访问 /server 兜底。
     """
-    log(f"正在打开服务器列表页: {SERVER_LIST_URL}")
+    manage_links = page.locator('a:has-text("Manage Server")')
+    count = manage_links.count()
+    if count > 0:
+        hrefs = []
+        for i in range(count):
+            href = manage_links.nth(i).get_attribute("href")
+            if href and href not in hrefs:
+                hrefs.append(href)
+        log(f"在当前页（Dashboard）通过 'Manage Server' 按钮找到 {len(hrefs)} 个服务器")
+        return hrefs
+
+    log(f"当前页未找到服务器卡片，尝试访问服务器列表页: {SERVER_LIST_URL}")
     page.goto(SERVER_LIST_URL, timeout=60000)
     page.wait_for_timeout(3000)
 
