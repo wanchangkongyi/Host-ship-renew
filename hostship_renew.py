@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
@@ -113,37 +114,79 @@ def find_server_links(page):
     return []
 
 
+def get_renewal_days_remaining(page):
+    """
+    读取页面上 "Renewal in X Days" 卡片的剩余天数。
+    读取不到时返回 None（不影响后续续期尝试，只影响日志展示）。
+    """
+    try:
+        el = page.locator('text=/\\d+\\s*Days?/i').first
+        if el.count() > 0:
+            text = el.inner_text(timeout=3000)
+            m = re.search(r'(\d+)\s*Days?', text, re.IGNORECASE)
+            if m:
+                return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
 def renew_server(page, url):
     """
     进入单个服务器详情页并点击续期。
+    该面板的续期是以"天"为单位的倒计时（Renewal in X Days），
+    临近到期前 Renew 按钮才可点击，过早点击时按钮可能是禁用状态，
+    这里做了 disabled 判断，禁用状态视为正常（还没到续期窗口），而不是报错。
     """
     full_url = url if url.startswith("http") else f"{PANEL_URL.rstrip('/')}{url}"
     log(f"打开服务器详情页: {full_url}")
     page.goto(full_url, timeout=60000)
     page.wait_for_timeout(3000)
 
+    days_left = get_renewal_days_remaining(page)
+    if days_left is not None:
+        log(f"距离到期还剩 {days_left} 天")
+    else:
+        warn("未能读取到剩余天数，继续尝试查找续期按钮")
+
     renew_btn_texts = ["Renew", "续期", "Renouveler"]
+    target_btn = None
+    matched_text = None
     for text in renew_btn_texts:
         btn = page.locator(f'button:has-text("{text}")')
         if btn.count() > 0 and btn.first.is_visible():
-            btn.first.scroll_into_view_if_needed()
-            btn.first.click()
-            log(f"点击了续期按钮 (文字: {text})")
+            target_btn = btn.first
+            matched_text = text
+            break
+
+    if target_btn is None:
+        warn(f"未在 {full_url} 找到续期按钮，请检查 renew_btn_texts 或页面结构")
+        return False
+
+    try:
+        if target_btn.is_disabled():
+            log(f"续期按钮当前不可点击（可能还没到续期窗口期，剩余 {days_left if days_left is not None else '未知'} 天），跳过")
+            return False
+    except Exception:
+        # 部分自定义组件不是原生 <button disabled>，is_disabled 可能取不到，忽略继续尝试点击
+        pass
+
+    target_btn.scroll_into_view_if_needed()
+    target_btn.click()
+    log(f"点击了续期按钮 (文字: {matched_text})")
+    page.wait_for_timeout(2000)
+
+    # 有些面板续期需要二次确认弹窗
+    confirm_texts = ["Confirm", "确认", "Yes", "OK"]
+    for c_text in confirm_texts:
+        confirm_btn = page.locator(f'button:has-text("{c_text}")')
+        if confirm_btn.count() > 0 and confirm_btn.first.is_visible(timeout=2000):
+            confirm_btn.first.click()
+            log(f"点击了确认按钮 (文字: {c_text})")
             page.wait_for_timeout(2000)
+            break
 
-            # 有些面板续期需要二次确认弹窗
-            confirm_texts = ["Confirm", "确认", "Yes", "OK"]
-            for c_text in confirm_texts:
-                confirm_btn = page.locator(f'button:has-text("{c_text}")')
-                if confirm_btn.count() > 0 and confirm_btn.first.is_visible(timeout=2000):
-                    confirm_btn.first.click()
-                    log(f"点击了确认按钮 (文字: {c_text})")
-                    page.wait_for_timeout(2000)
-                    break
-            return True
-
-    warn(f"未在 {full_url} 找到续期按钮，可能已续期/按钮文字不匹配，请检查 renew_btn_texts")
-    return False
+    return True
 
 
 def run(playwright):
