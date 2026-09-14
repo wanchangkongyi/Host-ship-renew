@@ -52,21 +52,20 @@ def login(page, username, password):
     sign_in_btn.first.click()
     log("已点击 Sign In")
 
-    page.wait_for_timeout(4000)
+    page.wait_for_timeout(3000)
 
-    # 简单校验是否登录成功：URL 是否已经离开登录页
-    if page.url.rstrip("/") == LOGIN_URL.rstrip("/"):
-        # 有些面板登录失败会原地报错（如密码错误），也有可能是页面还在异步跳转，
-        # 这里多等 2 秒后再判断一次，减少误报。
-        page.wait_for_timeout(2000)
-        if page.url.rstrip("/") == LOGIN_URL.rstrip("/"):
-            screenshot_path = "login_failed.png"
-            try:
-                page.screenshot(path=screenshot_path, full_page=True)
-                err(f"已保存失败截图: {screenshot_path}（会作为 Actions Artifact 上传，可下载查看）")
-            except Exception as e:
-                warn(f"截图保存失败: {e}")
-            raise RuntimeError("登录后 URL 未发生变化，可能账号密码错误，或页面上出现了验证码/人机校验等未处理的提示")
+    # 这个面板未登录/已登录都停留在同一个 URL（未登录显示登录表单，登录后显示 Dashboard），
+    # 所以不能用"URL 是否变化"来判断，改用"登录表单（密码框）是否还存在"来判断。
+    if page.get_by_placeholder("Password").count() > 0:
+        screenshot_path = "login_failed.png"
+        try:
+            page.screenshot(path=screenshot_path, full_page=True)
+            err(f"已保存失败截图: {screenshot_path}（会作为 Actions Artifact 上传，可下载查看）")
+        except Exception as e:
+            warn(f"截图保存失败: {e}")
+        raise RuntimeError("登录后仍能看到密码输入框，可能账号密码错误，或页面上出现了验证码/人机校验等未处理的提示")
+
+    log(f"登录成功，当前 URL: {page.url}")
 
     log(f"登录成功，当前 URL: {page.url}")
 
@@ -74,13 +73,25 @@ def login(page, username, password):
 def find_server_links(page):
     """
     进入服务器列表页（已知地址 /server），收集所有服务器详情页链接。
-    如果这里匹配不到，说明详情页链接的 href 特征和猜测的不一样，
-    请 F12 查看具体某个服务器卡片/链接的 href 前缀，加入 candidate_selectors。
+    该面板基于 Jexactyl（Pterodactyl 分支），服务器卡片的入口按钮文字是
+    "Manage Server"，一般包裹在 <a href="/server/xxxx"> 里。
     """
     log(f"正在打开服务器列表页: {SERVER_LIST_URL}")
     page.goto(SERVER_LIST_URL, timeout=60000)
     page.wait_for_timeout(3000)
 
+    manage_links = page.locator('a:has-text("Manage Server")')
+    count = manage_links.count()
+    if count > 0:
+        hrefs = []
+        for i in range(count):
+            href = manage_links.nth(i).get_attribute("href")
+            if href and href not in hrefs:
+                hrefs.append(href)
+        log(f"通过 'Manage Server' 按钮找到 {len(hrefs)} 个服务器")
+        return hrefs
+
+    # 兜底：如果按钮不是 <a> 而是别的标签，尝试常见 href 特征
     candidate_selectors = [
         'a[href*="/server/"]',
         'a[href*="/servers/"]',
