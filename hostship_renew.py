@@ -184,10 +184,10 @@ def renew_server(page, url):
     target_btn.scroll_into_view_if_needed()
     target_btn.click()
     log(f"点击了续期按钮 (文字: {matched_text})")
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(2500)
 
     # 有些面板续期需要二次确认弹窗
-    confirm_texts = ["Confirm", "确认", "Yes", "OK"]
+    confirm_texts = ["Renew now", "Confirm", "确认", "Yes", "OK"]
     for c_text in confirm_texts:
         confirm_btn = page.locator(f'button:has-text("{c_text}")')
         if confirm_btn.count() > 0 and confirm_btn.first.is_visible(timeout=2000):
@@ -195,6 +195,21 @@ def renew_server(page, url):
             log(f"点击了确认按钮 (文字: {c_text})")
             page.wait_for_timeout(2000)
             break
+
+    # 不确定面板是用弹窗/toast/静默拒绝哪种方式反馈结果，
+    # 统一截图留证，方便人工确认点击后到底发生了什么（成功提示/报错提示/无变化）。
+    try:
+        page.screenshot(path="renew_result.png", full_page=True)
+        log("已保存续期点击后的截图: renew_result.png（会作为 Actions Artifact 上传）")
+    except Exception as e:
+        warn(f"截图保存失败: {e}")
+
+    days_left_after = get_renewal_days_remaining(page)
+    if days_left_after is not None and days_left is not None:
+        if days_left_after != days_left:
+            log(f"剩余天数已从 {days_left} 变为 {days_left_after}，续期确认生效")
+        else:
+            warn(f"点击后剩余天数仍是 {days_left_after} 天，未发生变化，续期可能未被面板接受（请查看 renew_result.png 截图确认具体提示）")
 
     return True
 
