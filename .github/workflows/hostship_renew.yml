@@ -1,7 +1,7 @@
 name: HostShip Auto Renew
 on:
   schedule:
-    - cron: '15 3 * * *'   # 每天 UTC 03:15（北京时间 11:15）运行一次，可按需调整
+    - cron: '15 3 */5 * *'   
   workflow_dispatch:
 permissions:
   contents: write   # Keep Repo Active 步骤需要 push 权限；若仓库 Settings->Actions 已开
