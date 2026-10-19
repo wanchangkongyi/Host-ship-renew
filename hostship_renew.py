@@ -3,6 +3,8 @@ import re
 import time
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
+from proxy_utils import start_proxy
+
 PANEL_URL = "https://panel.host-ship.com/"
 LOGIN_URL = PANEL_URL  # 面板首页会自动展示登录表单（如未跳转，改成 https://panel.host-ship.com/login）
 SERVER_LIST_URL = "https://panel.host-ship.com/server"
@@ -20,6 +22,111 @@ def err(msg):
     print(f"[ERROR] {msg}")
 
 
+# ----------------------------------------------------------------------------
+# Cloudflare 过盾相关
+# ----------------------------------------------------------------------------
+CF_TITLE_HINTS = ("just a moment", "attention required", "请稍候", "执行安全验证")
+
+
+def _cf_challenge_active(page):
+    """判断当前是否停留在 Cloudflare 全页挑战（Just a moment...）"""
+    try:
+        title = (page.title() or "").lower()
+    except Exception:
+        return False
+    if any(h in title for h in CF_TITLE_HINTS):
+        return True
+    try:
+        return page.locator("#challenge-running, #challenge-form, .cf-browser-verification").count() > 0
+    except Exception:
+        return False
+
+
+def _click_turnstile(page):
+    """尝试点击 Turnstile 复选框（best effort）。点到返回 True"""
+    for frame in page.frames:
+        if "challenges.cloudflare.com" not in (frame.url or ""):
+            continue
+        try:
+            box = frame.frame_element().bounding_box()
+            if not box or box["width"] < 100:
+                continue
+            # 复选框位于 iframe 左侧，垂直居中
+            page.mouse.click(box["x"] + 28, box["y"] + box["height"] / 2)
+            log("已尝试点击 Cloudflare Turnstile 复选框")
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def wait_for_cloudflare(page, timeout=60):
+    """
+    等待 Cloudflare 挑战通过。没有挑战则立即返回 True；超时返回 False。
+    期间如果出现 Turnstile 复选框，会尝试点击。
+    """
+    if not _cf_challenge_active(page):
+        return True
+    log("检测到 Cloudflare 验证页，等待通过...")
+    end = time.time() + timeout
+    clicked_at = 0
+    while time.time() < end:
+        page.wait_for_timeout(2000)
+        if not _cf_challenge_active(page):
+            log("Cloudflare 验证已通过")
+            return True
+        if time.time() - clicked_at > 8 and _click_turnstile(page):
+            clicked_at = time.time()
+    warn("等待 Cloudflare 验证超时（可能 IP 信誉差，建议换一个代理节点）")
+    try:
+        page.screenshot(path="cf_blocked.png", full_page=True)
+    except Exception:
+        pass
+    return False
+
+
+def goto_safe(page, url, timeout=60000):
+    """page.goto + 自动等待 Cloudflare 挑战"""
+    page.goto(url, timeout=timeout)
+    wait_for_cloudflare(page)
+
+
+def solve_embedded_turnstile(page, timeout=20):
+    """登录表单内嵌 Turnstile 小组件时，点击并等待其生成 token（没有该组件则直接返回）"""
+    if page.locator('iframe[src*="challenges.cloudflare.com"], input[name="cf-turnstile-response"]').count() == 0:
+        return
+    log("登录页包含 Turnstile 组件，等待其完成...")
+    end = time.time() + timeout
+    last_click = 0
+    while time.time() < end:
+        try:
+            token = page.locator('input[name="cf-turnstile-response"]')
+            if token.count() > 0 and token.first.input_value():
+                log("Turnstile 已通过")
+                return
+        except Exception:
+            pass
+        if time.time() - last_click > 6 and _click_turnstile(page):
+            last_click = time.time()
+        page.wait_for_timeout(1500)
+    warn("Turnstile 未在限定时间内完成，仍尝试继续登录")
+
+
+def log_exit_ip(page):
+    """通过浏览器访问 IP 查询接口，确认出口 IP（用于验证代理是否生效）"""
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            page.goto(url, timeout=20000)
+            ip = page.inner_text("body", timeout=5000).strip()
+            if re.fullmatch(r"[0-9a-fA-F:.]{7,45}", ip):
+                log(f"当前浏览器出口 IP: {ip}")
+                return ip
+        except Exception:
+            continue
+    warn("无法获取出口 IP（代理可能不通或查询接口被拦截）")
+    return None
+
+
 def login(page, username, password):
     """
     登录面板。选择器根据实际截图（Host Ship Free panel 登录页）确认：
@@ -28,7 +135,7 @@ def login(page, username, password):
     - 登录按钮：文字 = "Sign In"
     """
     log("正在打开登录页...")
-    page.goto(LOGIN_URL, timeout=60000)
+    goto_safe(page, LOGIN_URL)
     page.wait_for_timeout(2000)
 
     username_input = page.get_by_placeholder("Username or Email")
@@ -43,6 +150,8 @@ def login(page, username, password):
     password_input.first.fill(password)
     log("已填入用户名和密码")
 
+    solve_embedded_turnstile(page)
+
     sign_in_btn = page.get_by_role("button", name="Sign In")
     if sign_in_btn.count() == 0:
         # 兜底：按纯文字匹配（get_by_role 依赖无障碍标签，个别情况下可能取不到）
@@ -54,6 +163,7 @@ def login(page, username, password):
     log("已点击 Sign In")
 
     page.wait_for_timeout(3000)
+    wait_for_cloudflare(page)
 
     # 这个面板未登录/已登录都停留在同一个 URL（未登录显示登录表单，登录后显示 Dashboard），
     # 所以不能用"URL 是否变化"来判断，改用"登录表单（密码框）是否还存在"来判断。
@@ -88,7 +198,7 @@ def find_server_links(page):
         return hrefs
 
     log(f"当前页未找到服务器卡片，尝试访问服务器列表页: {SERVER_LIST_URL}")
-    page.goto(SERVER_LIST_URL, timeout=60000)
+    goto_safe(page, SERVER_LIST_URL)
     page.wait_for_timeout(3000)
 
     manage_links = page.locator('a:has-text("Manage Server")')
@@ -150,7 +260,7 @@ def renew_server(page, url):
     """
     full_url = url if url.startswith("http") else f"{PANEL_URL.rstrip('/')}{url}"
     log(f"打开服务器详情页: {full_url}")
-    page.goto(full_url, timeout=60000)
+    goto_safe(page, full_url)
     page.wait_for_timeout(3000)
 
     days_left = get_renewal_days_remaining(page)
@@ -222,14 +332,44 @@ def run(playwright):
         err("未设置 PANEL_USERNAME 或 PANEL_PASSWORD 环境变量")
         return
 
-    browser = playwright.chromium.launch(headless=True)
+    # ---- 代理（可选）：环境变量 PROXY_URL，支持 vless/vmess/trojan/ss/hysteria2/socks5/http ----
+    proxy_handle = None
+    proxy_url = os.environ.get("PROXY_URL", "").strip()
+    if proxy_url:
+        try:
+            proxy_handle = start_proxy(proxy_url, log=log)
+        except Exception as e:
+            err(f"代理启动失败: {e}")
+            return
+    else:
+        log("未设置 PROXY_URL，将直连访问（如被 Cloudflare 拦截，请配置代理）")
+
+    # 在 CI 里建议配合 xvfb-run 使用有头模式（HEADLESS=false），更容易通过 Cloudflare
+    headless = os.environ.get("HEADLESS", "true").strip().lower() not in ("0", "false", "no")
+
+    launch_kwargs = {
+        "headless": headless,
+        "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+    }
+    if proxy_handle:
+        launch_kwargs["proxy"] = proxy_handle.playwright_proxy
+
+    browser = playwright.chromium.launch(**launch_kwargs)
     context = browser.new_context(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        viewport={"width": 1366, "height": 768},
+        locale="en-US",
     )
+    context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
     page = context.new_page()
 
     try:
+        if proxy_handle:
+            if not log_exit_ip(page):
+                err("已配置代理但无法通过代理访问外网，流程终止（请检查 PROXY_URL 节点是否可用）")
+                return
+
         login(page, username, password)
 
         hrefs = find_server_links(page)
@@ -259,6 +399,8 @@ def run(playwright):
             warn(f"错误截图保存失败: {shot_err}")
     finally:
         browser.close()
+        if proxy_handle:
+            proxy_handle.stop()
 
 
 with sync_playwright() as playwright:
