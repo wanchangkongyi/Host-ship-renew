@@ -11,6 +11,9 @@ jobs:
   renew-job:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      PROXY_URL: ${{ secrets.PROXY_URL }}   # 可选：vless:// vmess:// trojan:// ss:// hysteria2:// socks5:// http://
+      SING_BOX_VERSION: "1.11.15"
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -31,11 +34,24 @@ jobs:
           pip install playwright
           playwright install --with-deps chromium
 
+      - name: Install sing-box (proxy core)
+        if: env.PROXY_URL != ''
+        run: |
+          curl -fsSL -o sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz"
+          tar -xzf sb.tar.gz
+          sudo install -m 755 "sing-box-${SING_BOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          rm -rf sb.tar.gz "sing-box-${SING_BOX_VERSION}-linux-amd64"
+          sing-box version
+
+      - name: Install xvfb (headed browser helps pass Cloudflare)
+        run: sudo apt-get install -y xvfb
+
       - name: Run Renew Script
         env:
           PANEL_USERNAME: ${{ secrets.PANEL_USERNAME }}
           PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
-        run: python hostship_renew.py
+          HEADLESS: "false"
+        run: xvfb-run -a python hostship_renew.py
 
       - name: Upload debug screenshot (if any)
         if: always()
@@ -45,6 +61,8 @@ jobs:
           path: |
             login_failed.png
             error.png
+            cf_blocked.png
+            renew_result.png
           if-no-files-found: ignore
           retention-days: 3
 
