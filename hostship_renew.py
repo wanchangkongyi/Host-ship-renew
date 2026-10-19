@@ -1,7 +1,14 @@
+import json
 import os
 import re
 import time
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+try:
+    # patchright 是 playwright 的直接替代品，修补了 CDP 自动化特征泄露，更容易通过 Turnstile
+    from patchright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+    USING_PATCHRIGHT = True
+except ImportError:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+    USING_PATCHRIGHT = False
 
 from proxy_utils import start_proxy
 
@@ -91,76 +98,115 @@ def goto_safe(page, url, timeout=60000):
     wait_for_cloudflare(page)
 
 
-def solve_embedded_turnstile(page, timeout=20):
-    """登录表单内嵌 Turnstile 小组件时，点击并等待其生成 token（没有该组件则直接返回）"""
-    if page.locator('iframe[src*="challenges.cloudflare.com"], input[name="cf-turnstile-response"]').count() == 0:
-        return
-    log("登录页包含 Turnstile 组件，等待其完成...")
-    end = time.time() + timeout
+def wait_turnstile_token(page, timeout=45):
+    """
+    等待登录页内嵌的 Turnstile 自动通过（出现非空 token）。没有该组件则直接返回 True。
+    前 12 秒只等待不点击（托管模式通常会自动通过，乱点反而容易被判为机器人），之后才尝试点击。
+    """
+    sel = 'iframe[src*="challenges.cloudflare.com"], input[name="cf-turnstile-response"]'
+    if page.locator(sel).count() == 0:
+        return True
+    log("登录页包含 Turnstile 组件，等待其自动通过...")
+    start = time.time()
     last_click = 0
-    while time.time() < end:
+    while time.time() - start < timeout:
         try:
             token = page.locator('input[name="cf-turnstile-response"]')
             if token.count() > 0 and token.first.input_value():
-                log("Turnstile 已通过")
-                return
+                log(f"Turnstile 已通过（用时 {time.time() - start:.0f}s）")
+                return True
         except Exception:
             pass
-        if time.time() - last_click > 6 and _click_turnstile(page):
+        if time.time() - start > 12 and time.time() - last_click > 8 and _click_turnstile(page):
             last_click = time.time()
-        page.wait_for_timeout(1500)
-    warn("Turnstile 未在限定时间内完成，仍尝试继续登录")
+        page.wait_for_timeout(1000)
+    return False
 
 
-def log_exit_ip(page):
-    """通过浏览器访问 IP 查询接口，确认出口 IP（用于验证代理是否生效）"""
-    for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+def probe_exit(browser):
+    """
+    用一个临时上下文访问 IP 查询接口，返回 {"ip":..., "tz":...}。
+    ip 用来确认代理生效；tz 是出口 IP 所在时区，后面用来设置浏览器时区，
+    避免“浏览器是 UTC、IP 却在别的国家”这种 Turnstile 会检查的不一致。
+    失败返回 None。
+    """
+    ctx = browser.new_context()
+    try:
+        page = ctx.new_page()
         try:
-            page.goto(url, timeout=20000)
+            page.goto("https://ipwho.is/", timeout=20000)
+            d = json.loads(page.inner_text("body", timeout=5000))
+            if d.get("success", True) and d.get("ip"):
+                tz = (d.get("timezone") or {}).get("id")
+                log(f"当前浏览器出口 IP: {d['ip']}  ({d.get('country', '?')}, 时区 {tz})")
+                return {"ip": d["ip"], "tz": tz}
+        except Exception:
+            pass
+        try:
+            page.goto("https://api.ipify.org", timeout=20000)
             ip = page.inner_text("body", timeout=5000).strip()
             if re.fullmatch(r"[0-9a-fA-F:.]{7,45}", ip):
                 log(f"当前浏览器出口 IP: {ip}")
-                return ip
+                return {"ip": ip, "tz": None}
         except Exception:
-            continue
-    warn("无法获取出口 IP（代理可能不通或查询接口被拦截）")
-    return None
+            pass
+        warn("无法获取出口 IP（代理可能不通或查询接口被拦截）")
+        return None
+    finally:
+        ctx.close()
 
 
-def login(page, username, password):
+def login(page, username, password, max_attempts=3):
     """
     登录面板。选择器根据实际截图（Host Ship Free panel 登录页）确认：
     - 用户名/邮箱输入框：placeholder = "Username or Email"
     - 密码输入框：placeholder = "Password"
-    - 登录按钮：文字 = "Sign In"
+    - 登录按钮：Turnstile 通过前文字是 "Complete the security check"（禁用），通过后变为 "Sign In"
+
+    Turnstile 偶发 "Verification failed" 时会刷新页面重试，最多 max_attempts 次。
     """
-    log("正在打开登录页...")
-    goto_safe(page, LOGIN_URL)
-    page.wait_for_timeout(2000)
+    passed = False
+    for attempt in range(1, max_attempts + 1):
+        log(f"正在打开登录页...（第 {attempt}/{max_attempts} 次）")
+        goto_safe(page, LOGIN_URL)
+        page.wait_for_timeout(2000)
 
-    username_input = page.get_by_placeholder("Username or Email")
-    password_input = page.get_by_placeholder("Password")
+        username_input = page.get_by_placeholder("Username or Email")
+        password_input = page.get_by_placeholder("Password")
+        if username_input.count() == 0:
+            raise RuntimeError('未找到 placeholder="Username or Email" 的输入框，页面结构可能已变化')
+        if password_input.count() == 0:
+            raise RuntimeError('未找到 placeholder="Password" 的输入框，页面结构可能已变化')
 
-    if username_input.count() == 0:
-        raise RuntimeError('未找到 placeholder="Username or Email" 的输入框，页面结构可能已变化')
-    if password_input.count() == 0:
-        raise RuntimeError('未找到 placeholder="Password" 的输入框，页面结构可能已变化')
+        # 像真人一样逐字输入，而不是瞬间填充
+        username_input.first.click()
+        username_input.first.press_sequentially(username, delay=60)
+        password_input.first.click()
+        password_input.first.press_sequentially(password, delay=60)
+        log("已填入用户名和密码")
 
-    username_input.first.fill(username)
-    password_input.first.fill(password)
-    log("已填入用户名和密码")
+        if wait_turnstile_token(page):
+            passed = True
+            break
+        warn("Turnstile 未通过（可能显示 Verification failed），刷新页面重试")
+        try:
+            page.screenshot(path=f"turnstile_failed_{attempt}.png", full_page=True)
+        except Exception:
+            pass
+        page.wait_for_timeout(3000)
 
-    solve_embedded_turnstile(page)
+    if not passed:
+        raise RuntimeError("Turnstile 多次验证失败：出口 IP 或浏览器指纹被 Cloudflare 拒绝，请更换代理节点或查看 turnstile_failed_*.png")
 
+    # Turnstile 通过后按钮会启用；用提交按钮兜底，避免依赖按钮文字
     sign_in_btn = page.get_by_role("button", name="Sign In")
     if sign_in_btn.count() == 0:
-        # 兜底：按纯文字匹配（get_by_role 依赖无障碍标签，个别情况下可能取不到）
-        sign_in_btn = page.locator('button:has-text("Sign In")')
+        sign_in_btn = page.locator('button:has-text("Sign In"), form button[type="submit"], button[type="submit"]')
     if sign_in_btn.count() == 0:
-        raise RuntimeError('未找到 "Sign In" 按钮，页面结构可能已变化')
+        raise RuntimeError('未找到登录按钮，页面结构可能已变化')
 
     sign_in_btn.first.click()
-    log("已点击 Sign In")
+    log("已点击登录按钮")
 
     page.wait_for_timeout(3000)
     wait_for_cloudflare(page)
@@ -349,26 +395,46 @@ def run(playwright):
 
     launch_kwargs = {
         "headless": headless,
-        "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        # 去掉 --enable-automation，并关闭 AutomationControlled 特征；不再手动改 UA / webdriver
+        "ignore_default_args": ["--enable-automation"],
+        "args": ["--disable-blink-features=AutomationControlled"],
     }
     if proxy_handle:
         launch_kwargs["proxy"] = proxy_handle.playwright_proxy
 
-    browser = playwright.chromium.launch(**launch_kwargs)
-    context = browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        viewport={"width": 1366, "height": 768},
-        locale="en-US",
-    )
-    context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
-    page = context.new_page()
+    log(f"自动化引擎: {'patchright' if USING_PATCHRIGHT else 'playwright（建议安装 patchright 以提高过盾率）'}")
+
+    # 优先使用真实 Chrome（指纹比 Playwright 自带 Chromium 更自然），不可用时回退
+    browser = None
+    for channel in ([os.environ.get("BROWSER_CHANNEL", "chrome")] if os.environ.get("BROWSER_CHANNEL", "chrome") else []) + [None]:
+        try:
+            kw = dict(launch_kwargs)
+            if channel:
+                kw["channel"] = channel
+            browser = playwright.chromium.launch(**kw)
+            log(f"浏览器已启动: {channel or '内置 Chromium'}")
+            break
+        except Exception as e:
+            warn(f"启动 {channel or 'Chromium'} 失败: {str(e).splitlines()[0]}")
+    if browser is None:
+        err("无法启动浏览器")
+        if proxy_handle:
+            proxy_handle.stop()
+        return
 
     try:
+        exit_info = None
         if proxy_handle:
-            if not log_exit_ip(page):
+            exit_info = probe_exit(browser)
+            if not exit_info:
                 err("已配置代理但无法通过代理访问外网，流程终止（请检查 PROXY_URL 节点是否可用）")
                 return
+
+        ctx_kwargs = {"no_viewport": True}   # 不覆盖 UA / 视口，保持真实浏览器指纹
+        if exit_info and exit_info.get("tz"):
+            ctx_kwargs["timezone_id"] = exit_info["tz"]   # 时区与出口 IP 保持一致
+        context = browser.new_context(**ctx_kwargs)
+        page = context.new_page()
 
         login(page, username, password)
 
