@@ -23,16 +23,10 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}
-
-      - name: Install dependencies
+      - name: Install dependencies (patchright + real Chrome)
         run: |
-          pip install playwright
-          playwright install --with-deps chromium
+          pip install patchright
+          patchright install --with-deps chrome
 
       - name: Install sing-box (proxy core)
         if: env.PROXY_URL != ''
@@ -51,7 +45,7 @@ jobs:
           PANEL_USERNAME: ${{ secrets.PANEL_USERNAME }}
           PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
           HEADLESS: "false"
-        run: xvfb-run -a python hostship_renew.py
+        run: xvfb-run -a -s "-screen 0 1366x768x24" python hostship_renew.py
 
       - name: Upload debug screenshot (if any)
         if: always()
@@ -62,6 +56,7 @@ jobs:
             login_failed.png
             error.png
             cf_blocked.png
+            turnstile_failed_*.png
             renew_result.png
           if-no-files-found: ignore
           retention-days: 3
