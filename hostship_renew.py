@@ -16,6 +16,10 @@ PANEL_URL = "https://panel.host-ship.com/"
 LOGIN_URL = PANEL_URL  # 面板首页会自动展示登录表单（如未跳转，改成 https://panel.host-ship.com/login）
 SERVER_LIST_URL = "https://panel.host-ship.com/server"
 
+# 续期规则：剩余天数低于该值才允许续期（面板提示 "when it drops below 14 days"）。
+# 可用环境变量 RENEW_THRESHOLD_DAYS 调整。
+RENEW_THRESHOLD_DAYS = int(os.environ.get("RENEW_THRESHOLD_DAYS", "14"))
+
 
 def log(msg):
     print(f"[INFO] {msg}")
@@ -280,21 +284,43 @@ def find_server_links(page):
     return []
 
 
+def _body_text(page):
+    try:
+        return page.inner_text("body", timeout=5000)
+    except Exception:
+        return ""
+
+
 def get_renewal_days_remaining(page):
     """
-    读取页面上 "Renewal in X Days" 卡片的剩余天数。
-    读取不到时返回 None（不影响后续续期尝试，只影响日志展示）。
+    读取服务器剩余天数。按可靠程度依次尝试：
+    1. 右侧 "EXPIRES 4 NOV / 10 Days" 卡片（实际页面结构）
+    2. "Renewal in X Days" / "Current renewal in: X days"
+    3. 页面上第一个 "X Days"
+    读取不到返回 None。
     """
-    try:
-        el = page.locator('text=/\\d+\\s*Days?/i').first
-        if el.count() > 0:
-            text = el.inner_text(timeout=3000)
-            m = re.search(r'(\d+)\s*Days?', text, re.IGNORECASE)
-            if m:
-                return int(m.group(1))
-    except Exception:
-        pass
+    text = _body_text(page)
+    patterns = [
+        r'Expires[^\n]*\n\s*(\d+)\s*Days?',
+        r'Renewal\s+in:?\s*(\d+)\s*Days?',
+        r'(\d+)\s*Days?',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
     return None
+
+
+def get_not_yet_message(page):
+    """
+    读取面板的"还不能续期"提示，例如
+    "You can renew again tomorrow, when it drops below 14 days."
+    没有该提示返回 None。
+    """
+    text = _body_text(page)
+    m = re.search(r'You can renew again[^\n.]*\.?', text, re.IGNORECASE)
+    return m.group(0).strip() if m else None
 
 
 def renew_server(page, url):
@@ -311,9 +337,18 @@ def renew_server(page, url):
 
     days_left = get_renewal_days_remaining(page)
     if days_left is not None:
-        log(f"距离到期还剩 {days_left} 天")
+        log(f"距离到期还剩 {days_left} 天（续期条件：低于 {RENEW_THRESHOLD_DAYS} 天）")
     else:
         warn("未能读取到剩余天数，继续尝试查找续期按钮")
+
+    # 还没到续期窗口：面板会给出 "You can renew again ..." 提示，或剩余天数 >= 阈值
+    not_yet = get_not_yet_message(page)
+    if not_yet:
+        log(f"面板提示暂不可续期: {not_yet}，跳过")
+        return "skipped"
+    if days_left is not None and days_left >= RENEW_THRESHOLD_DAYS:
+        log(f"剩余 {days_left} 天 ≥ {RENEW_THRESHOLD_DAYS} 天，未到续期窗口，跳过")
+        return "skipped"
 
     renew_btn_texts = ["Renew", "续期", "Renouveler"]
     target_btn = None
@@ -327,12 +362,12 @@ def renew_server(page, url):
 
     if target_btn is None:
         warn(f"未在 {full_url} 找到续期按钮，请检查 renew_btn_texts 或页面结构")
-        return False
+        return "failed"
 
     try:
         if target_btn.is_disabled():
             log(f"续期按钮当前不可点击（可能还没到续期窗口期，剩余 {days_left if days_left is not None else '未知'} 天），跳过")
-            return False
+            return "skipped"
     except Exception:
         # 部分自定义组件不是原生 <button disabled>，is_disabled 可能取不到，忽略继续尝试点击
         pass
@@ -342,15 +377,35 @@ def renew_server(page, url):
     log(f"点击了续期按钮 (文字: {matched_text})")
     page.wait_for_timeout(2500)
 
-    # 有些面板续期需要二次确认弹窗
-    confirm_texts = ["Renew now", "Confirm", "确认", "Yes", "OK"]
-    for c_text in confirm_texts:
-        confirm_btn = page.locator(f'button:has-text("{c_text}")')
-        if confirm_btn.count() > 0 and confirm_btn.first.is_visible(timeout=2000):
-            confirm_btn.first.click()
-            log(f"点击了确认按钮 (文字: {c_text})")
-            page.wait_for_timeout(2000)
-            break
+    # 点击 Renew 后会弹出确认框："This adds 4 days ... [Cancel] [Add 4 days]"，
+    # 必须再点 "Add N days" 才会真正续期。
+    confirm_btn = page.get_by_role("button", name=re.compile(r"^\s*Add\s+\d+\s+days?\s*$", re.IGNORECASE))
+    try:
+        confirm_btn.first.wait_for(state="visible", timeout=8000)
+    except PlaywrightTimeout:
+        confirm_btn = None
+
+    if confirm_btn is not None:
+        try:
+            info = page.get_by_text(re.compile(r"This adds\s+\d+\s+days?", re.IGNORECASE)).first.inner_text(timeout=2000)
+            log(f"续期确认框: {info.strip()}")
+        except Exception:
+            pass
+        btn_text = confirm_btn.first.inner_text().strip()
+        confirm_btn.first.click()
+        log(f"点击了确认按钮 ({btn_text})")
+        page.wait_for_timeout(3000)
+    else:
+        # 兜底：兼容其他面板常见的确认按钮文字
+        for c_text in ["Renew now", "Confirm", "确认"]:
+            fallback = page.get_by_role("button", name=c_text)
+            if fallback.count() > 0 and fallback.first.is_visible():
+                fallback.first.click()
+                log(f"点击了确认按钮 (文字: {c_text})")
+                page.wait_for_timeout(3000)
+                break
+        else:
+            warn("点击 Renew 后未出现确认弹窗，可能面板直接续期，或页面结构已变化")
 
     # 不确定面板是用弹窗/toast/静默拒绝哪种方式反馈结果，
     # 统一截图留证，方便人工确认点击后到底发生了什么（成功提示/报错提示/无变化）。
@@ -360,14 +415,24 @@ def renew_server(page, url):
     except Exception as e:
         warn(f"截图保存失败: {e}")
 
+    # 点击后重新加载页面再读天数，避免读到旧的前端状态
+    try:
+        page.reload(timeout=60000)
+        page.wait_for_timeout(3000)
+        wait_for_cloudflare(page)
+    except Exception as e:
+        warn(f"刷新页面失败: {e}")
+
     days_left_after = get_renewal_days_remaining(page)
     if days_left_after is not None and days_left is not None:
-        if days_left_after != days_left:
+        if days_left_after > days_left:
             log(f"剩余天数已从 {days_left} 变为 {days_left_after}，续期确认生效")
-        else:
-            warn(f"点击后剩余天数仍是 {days_left_after} 天，未发生变化，续期可能未被面板接受（请查看 renew_result.png 截图确认具体提示）")
+            return "renewed"
+        warn(f"点击后剩余天数仍是 {days_left_after} 天，未增加，续期可能未被面板接受（请查看 renew_result.png 截图确认具体提示）")
+        return "failed"
 
-    return True
+    log("无法对比续期前后天数，已点击续期按钮，请查看 renew_result.png 确认")
+    return "renewed"
 
 
 def run(playwright):
@@ -443,18 +508,20 @@ def run(playwright):
             err("未找到任何服务器，流程终止")
             return
 
-        success_count = 0
+        stats = {"renewed": 0, "skipped": 0, "failed": 0}
         for idx, href in enumerate(hrefs):
             log(f"--- 处理第 {idx + 1}/{len(hrefs)} 个服务器 ---")
             try:
-                if renew_server(page, href):
-                    success_count += 1
+                stats[renew_server(page, href)] += 1
             except PlaywrightTimeout:
                 warn(f"处理 {href} 超时，跳过")
+                stats["failed"] += 1
             except Exception as e:
                 warn(f"处理 {href} 时出错: {e}")
+                stats["failed"] += 1
 
-        log(f"全部处理完成，成功续期 {success_count}/{len(hrefs)} 个服务器")
+        log(f"全部处理完成：续期成功 {stats['renewed']} 个，未到期跳过 {stats['skipped']} 个，"
+            f"失败 {stats['failed']} 个（共 {len(hrefs)} 个）")
 
     except Exception as e:
         err(f"执行过程中发生错误: {e}")
