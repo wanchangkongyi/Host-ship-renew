@@ -16,9 +16,11 @@ PANEL_URL = "https://panel.host-ship.com/"
 LOGIN_URL = PANEL_URL  # 面板首页会自动展示登录表单（如未跳转，改成 https://panel.host-ship.com/login）
 SERVER_LIST_URL = "https://panel.host-ship.com/server"
 
-# 续期规则：剩余天数低于该值才允许续期（面板提示 "when it drops below 14 days"）。
-# 可用环境变量 RENEW_THRESHOLD_DAYS 调整。
-RENEW_THRESHOLD_DAYS = int(os.environ.get("RENEW_THRESHOLD_DAYS", "14"))
+# 脚本自己的续期阈值：剩余天数低于该值才续期。
+# 面板规则是 "低于 14 天才允许续期，续期后最多补到 14 天"，所以天数越低一次补得越多。
+# 默认 7：等剩余不足 7 天再续，每次能补 7 天左右（比 13 天就续、只补 1 天要省事得多）。
+# 可用环境变量 RENEW_THRESHOLD_DAYS 调整，最大有效值为 14。
+RENEW_THRESHOLD_DAYS = min(int(os.environ.get("RENEW_THRESHOLD_DAYS", "7")), 14)
 
 
 def log(msg):
