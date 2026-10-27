@@ -14,6 +14,7 @@ jobs:
     env:
       PROXY_URL: ${{ secrets.PROXY_URL }}   # 可选：vless:// vmess:// trojan:// ss:// hysteria2:// socks5:// http://
       SING_BOX_VERSION: "1.11.15"
+      RENEW_THRESHOLD_DAYS: "7"   # 剩余天数低于该值才续期（面板上限 14）
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
